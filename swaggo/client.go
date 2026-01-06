@@ -20,13 +20,13 @@ type SwaggoMux struct {
 	baseUri     string
 	prefix      string
 	versions    []string
-	routes      []Route
+	routes      map[string]map[string]Route // path -> method -> Route
 	mu          sync.RWMutex
 }
 
 func NewSwaggoMux(swaggerInfo *SwaggerInfo, baseUri, prefix string, versions []string) *SwaggoMux {
 	client := &SwaggoMux{
-		routes:      make([]Route, 0),
+		routes:      make(map[string]map[string]Route),
 		swaggerInfo: swaggerInfo,
 		baseUri:     baseUri,
 		versions:    versions,
@@ -41,9 +41,10 @@ func NewSwaggoMux(swaggerInfo *SwaggerInfo, baseUri, prefix string, versions []s
 	}, "", RequestDetails{Method: "GET"})
 
 	for _, version := range versions {
+		v := version // capture range variable
 		client.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
-			client.swaggerJson(w, version)
-		}, version, RequestDetails{Method: "GET"})
+			client.swaggerJson(w, v)
+		}, v, RequestDetails{Method: "GET"})
 	}
 
 	return client
@@ -54,29 +55,45 @@ func (m *SwaggoMux) Handle(path string, handler http.Handler, version string, re
 	defer m.mu.Unlock()
 
 	var fullPath string
-
 	if version == "" {
 		fullPath = fmt.Sprintf("%s%s", m.prefix, path)
 	} else {
 		fullPath = fmt.Sprintf("%s/%s%s", m.prefix, version, path)
 	}
 
-	m.routes = append(m.routes, Route{Path: fullPath, Handler: handler, Prefix: m.prefix, Version: version, RequestDetails: requestDetails})
-	m.mux.Handle(fullPath, m.defaultMiddleware(handler, requestDetails))
+	if m.routes[fullPath] == nil {
+		m.routes[fullPath] = make(map[string]Route)
+		// Register a single handler for this path that dispatches by method
+		m.mux.Handle(fullPath, m.methodDispatchMiddleware(fullPath))
+	}
 
+	// Register/replace each method for this path
+	for _, rd := range requestDetails {
+		method := strings.ToUpper(rd.Method)
+		m.routes[fullPath][method] = Route{
+			Path:           fullPath,
+			Handler:        handler,
+			Prefix:         m.prefix,
+			Version:        version,
+			RequestDetails: []RequestDetails{rd},
+		}
+	}
 }
 
-func (m *SwaggoMux) defaultMiddleware(handler http.Handler, requestDetails []RequestDetails) http.Handler {
+// methodDispatchMiddleware dispatches to the correct handler based on HTTP method
+func (m *SwaggoMux) methodDispatchMiddleware(fullPath string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-		methods := ext.SliceMap(requestDetails, func(rd RequestDetails) string {
-			return rd.Method
-		})
-
-		if r.Method != http.MethodOptions && !ext.Contains(methods, r.Method) {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		method := strings.ToUpper(r.Method)
+		routeMap := m.routes[fullPath]
+		route, ok := routeMap[method]
+		if !ok {
+			// 405 if method not allowed
 			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		}
-		handler.ServeHTTP(w, r)
+		route.Handler.ServeHTTP(w, r)
 	})
 }
 
@@ -211,9 +228,17 @@ func (c *SwaggoMux) swagger(w http.ResponseWriter, r *http.Request) {
 
 func (c *SwaggoMux) MapDoc(version string) (*SwagDoc, error) {
 
-	tagNames := ext.SliceMap(ext.Where(c.routes, func(route Route) bool {
-		return (version == "" || route.Version == version)
-	}), func(route Route) string {
+	// Flatten all Route values from the map for tag and schema generation
+	var allRoutes []Route
+	for _, methodMap := range c.routes {
+		for _, route := range methodMap {
+			if version == "" || route.Version == version {
+				allRoutes = append(allRoutes, route)
+			}
+		}
+	}
+
+	tagNames := ext.SliceMap(allRoutes, func(route Route) string {
 		return route.GetPathWithoutPrefixAndVersion()
 	})
 
@@ -368,9 +393,17 @@ func (c *SwaggoMux) getRequestBodies(version string) (map[string]Body, error) {
 
 	requestBodies := make(map[string]Body)
 
-	distinctRequestBodies := ext.DistinctBy(ext.Where(ext.FlattenMap(ext.FlattenMap(ext.Where(c.routes, func(route Route) bool {
-		return (version == "" || route.Version == version)
-	}), func(route Route) []RequestDetails {
+	// Flatten all Route values from the map
+	var allRoutes []Route
+	for _, methodMap := range c.routes {
+		for _, route := range methodMap {
+			if version == "" || route.Version == version {
+				allRoutes = append(allRoutes, route)
+			}
+		}
+	}
+
+	distinctRequestBodies := ext.DistinctBy(ext.Where(ext.FlattenMap(ext.FlattenMap(allRoutes, func(route Route) []RequestDetails {
 		return route.RequestDetails
 	}), func(requestDetails RequestDetails) []RequestData {
 		return requestDetails.Requests
@@ -413,9 +446,17 @@ func (c *SwaggoMux) getRequestBodies(version string) (map[string]Body, error) {
 func (c *SwaggoMux) getSchemas(version string) (map[string]Schema, error) {
 	schemas := make(map[string]Schema)
 
-	distinctRequestTypes := ext.DistinctBy(ext.FlattenMap(ext.Where(c.routes, func(route Route) bool {
-		return (version == "" || route.Version == version)
-	}), func(route Route) []RequestData {
+	// Flatten all Route values from the map
+	var allRoutes []Route
+	for _, methodMap := range c.routes {
+		for _, route := range methodMap {
+			if version == "" || route.Version == version {
+				allRoutes = append(allRoutes, route)
+			}
+		}
+	}
+
+	distinctRequestTypes := ext.DistinctBy(ext.FlattenMap(allRoutes, func(route Route) []RequestData {
 		return ext.FlattenMap(route.RequestDetails, func(requestDetails RequestDetails) []RequestData {
 			return requestDetails.Requests
 		})
@@ -426,9 +467,7 @@ func (c *SwaggoMux) getSchemas(version string) (map[string]Schema, error) {
 		return reflect.TypeOf(reqBody.Data).String()
 	})
 
-	distinctResponseTypes := ext.DistinctBy(ext.FlattenMap(ext.Where(c.routes, func(route Route) bool {
-		return (version == "" || route.Version == version)
-	}), func(route Route) []ResponseData {
+	distinctResponseTypes := ext.DistinctBy(ext.FlattenMap(allRoutes, func(route Route) []ResponseData {
 		return ext.FlattenMap(route.RequestDetails, func(requestDetails RequestDetails) []ResponseData {
 			return requestDetails.Responses
 		})
@@ -510,7 +549,8 @@ func mapChildPropertiesToSchema(t reflect.Type, v reflect.Value) (Schema, error)
 
 			parsedType := parseGOTypeToSwaggerType(arrayType.Kind(), arrayType)
 
-			if parsedType == "array" {
+			switch parsedType {
+			case "array":
 
 				if value.Len() == 0 {
 					value = reflect.MakeSlice(reflect.SliceOf(arrayType), 1, 1)
@@ -529,7 +569,7 @@ func mapChildPropertiesToSchema(t reflect.Type, v reflect.Value) (Schema, error)
 				if err != nil {
 					return Schema{}, err
 				}
-			} else if parsedType == "object" {
+			case "object":
 				newT, newV, err := rawReflect(autoType(arrayType.Kind(), value))
 
 				if err != nil {
@@ -541,7 +581,7 @@ func mapChildPropertiesToSchema(t reflect.Type, v reflect.Value) (Schema, error)
 				if err != nil {
 					return Schema{}, err
 				}
-			} else {
+			default:
 				childItemValue = Schema{
 					Type: parsedType,
 				}
@@ -598,231 +638,207 @@ func mapChildPropertiesToSchema(t reflect.Type, v reflect.Value) (Schema, error)
 
 func (c *SwaggoMux) getPaths(version string) (map[string]map[string]Path, error) {
 	paths := make(map[string]map[string]Path)
-
-	for _, route := range ext.Where(c.routes, func(route Route) bool {
-		return !ext.Contains(IGNORED_TAGS, route.GetPathWithoutPrefixAndVersion()) && (version == "" || route.Version == version)
-	}) {
-
-		paths[route.Path] = make(map[string]Path)
-
-		tagName := route.GetPathWithoutPrefixAndVersion()
-
-		for _, rd := range route.RequestDetails {
-
-			parameterRequests := ext.Where(rd.Requests, func(rd RequestData) bool {
-				return ext.Contains([]RequestDataSource{QuerySource, PathSource, HeaderSource}, rd.Type)
-			})
-
-			parameters := make([]Parameter, 0)
-
-			for _, qr := range parameterRequests {
-
-				if qr.Data == nil {
-					continue
-				}
-
-				t, v, err := rawReflect(qr.Data)
-
-				if err != nil {
-					return nil, err
-				}
-
-				for i := 0; i < t.NumField(); i++ {
-					field := t.Field(i)
-					value := v.Field(i)
-
-					var fName string
-
-					if field.Tag.Get("name") != "" {
-						fName = field.Tag.Get("name")
-					} else {
-						fName = field.Name
-					}
-
-					swagType := parseGOTypeToSwaggerType(value.Kind(), value.Type())
-					var optionalFormat string
-					if swagType == "array" && isByteArray(field) {
-						swagType = "string"
-						optionalFormat = "binary"
-					} else if swagType == "object" && isTime(field) {
-						swagType = "string"
-						optionalFormat = "date-time"
-					}
-
-					parameters = append(parameters, Parameter{
-						Name:        fName,
-						In:          string(qr.Type),
-						Description: field.Tag.Get("description"),
-						Required:    field.Tag.Get("required") == "true",
-						Schema:      Schema{Type: swagType, Format: optionalFormat},
-					})
-				}
+	for fullPath, methodMap := range c.routes {
+		for _, route := range methodMap {
+			if ext.Contains(IGNORED_TAGS, route.GetPathWithoutPrefixAndVersion()) || (version != "" && route.Version != version) {
+				continue
 			}
-
-			bodyRequests := ext.Where(rd.Requests, func(rd RequestData) bool {
-				return rd.Type == BodySource
-			})
-
-			var body *Body
-
-			if len(bodyRequests) > 1 {
-				return nil, fmt.Errorf("only one body request is allowed")
-			} else if len(bodyRequests) == 1 {
-				for _, br := range bodyRequests {
-					body = &Body{
-						Content:     map[string]Content{},
-						Description: br.Description,
-						Required:    br.Required,
+			if paths[fullPath] == nil {
+				paths[fullPath] = make(map[string]Path)
+			}
+			tagName := route.GetPathWithoutPrefixAndVersion()
+			for _, rd := range route.RequestDetails {
+				parameterRequests := ext.Where(rd.Requests, func(rd RequestData) bool {
+					return ext.Contains([]RequestDataSource{QuerySource, PathSource, HeaderSource}, rd.Type)
+				})
+				parameters := make([]Parameter, 0)
+				for _, qr := range parameterRequests {
+					if qr.Data == nil {
+						continue
 					}
-
-					if len(br.ContentType) == 0 {
-						br.ContentType = []string{"application/json"} // default to application/json if no type is given
+					t, v, err := rawReflect(qr.Data)
+					if err != nil {
+						return nil, err
 					}
-
-					splitTypeName := strings.Split(reflect.TypeOf(br.Data).String(), ".")
-
-					bodyIsArray := isArray(br.Data)
-
-					if bodyIsArray {
-						for _, contentType := range br.ContentType {
-							body.Content[contentType] = Content{
-								Schema: Schema{
-									Type: "array",
-									Items: &Schema{
+					for i := 0; i < t.NumField(); i++ {
+						field := t.Field(i)
+						value := v.Field(i)
+						var fName string
+						if field.Tag.Get("name") != "" {
+							fName = field.Tag.Get("name")
+						} else {
+							fName = field.Name
+						}
+						swagType := parseGOTypeToSwaggerType(value.Kind(), value.Type())
+						var optionalFormat string
+						if swagType == "array" && isByteArray(field) {
+							swagType = "string"
+							optionalFormat = "binary"
+						} else if swagType == "object" && isTime(field) {
+							swagType = "string"
+							optionalFormat = "date-time"
+						}
+						parameters = append(parameters, Parameter{
+							Name:        fName,
+							In:          string(qr.Type),
+							Description: field.Tag.Get("description"),
+							Required:    field.Tag.Get("required") == "true",
+							Schema:      Schema{Type: swagType, Format: optionalFormat},
+						})
+					}
+				}
+				bodyRequests := ext.Where(rd.Requests, func(rd RequestData) bool {
+					return rd.Type == BodySource
+				})
+				var body *Body
+				if len(bodyRequests) > 1 {
+					return nil, fmt.Errorf("only one body request is allowed")
+				} else if len(bodyRequests) == 1 {
+					for _, br := range bodyRequests {
+						body = &Body{
+							Content:     map[string]Content{},
+							Description: br.Description,
+							Required:    br.Required,
+						}
+						if len(br.ContentType) == 0 {
+							br.ContentType = []string{"application/json"}
+						}
+						splitTypeName := strings.Split(reflect.TypeOf(br.Data).String(), ".")
+						bodyIsArray := isArray(br.Data)
+						if bodyIsArray {
+							for _, contentType := range br.ContentType {
+								body.Content[contentType] = Content{
+									Schema: Schema{
+										Type: "array",
+										Items: &Schema{
+											Ref: fmt.Sprintf("#/components/schemas/%s", splitTypeName[len(splitTypeName)-1]),
+										},
+									},
+								}
+							}
+						} else {
+							for _, contentType := range br.ContentType {
+								body.Content[contentType] = Content{
+									Schema: Schema{
 										Ref: fmt.Sprintf("#/components/schemas/%s", splitTypeName[len(splitTypeName)-1]),
 									},
-								},
-							}
-						}
-					} else {
-						for _, contentType := range br.ContentType {
-							body.Content[contentType] = Content{
-								Schema: Schema{
-									Ref: fmt.Sprintf("#/components/schemas/%s", splitTypeName[len(splitTypeName)-1]),
-								},
+								}
 							}
 						}
 					}
 				}
-			}
-
-			responses := map[string]Response{}
-
-			if len(rd.Responses) > 0 {
-				for _, res := range rd.Responses {
-					splitTypeName := strings.Split(reflect.TypeOf(res.Data).String(), ".")
-
-					content := map[string]Content{}
-
-					if len(res.ContentType) == 0 {
-						res.ContentType = []string{"application/json"} // default to application/json if no type is given
-					}
-
-					responseIsArray := isArray(res.Data)
-
-					if responseIsArray {
-						for _, contentType := range res.ContentType {
-							content[contentType] = Content{
-								Schema: Schema{
-									Type: "array",
-									Items: &Schema{
+				responses := map[string]Response{}
+				if len(rd.Responses) > 0 {
+					for _, res := range rd.Responses {
+						splitTypeName := strings.Split(reflect.TypeOf(res.Data).String(), ".")
+						content := map[string]Content{}
+						if len(res.ContentType) == 0 {
+							res.ContentType = []string{"application/json"}
+						}
+						responseIsArray := isArray(res.Data)
+						if responseIsArray {
+							for _, contentType := range res.ContentType {
+								content[contentType] = Content{
+									Schema: Schema{
+										Type: "array",
+										Items: &Schema{
+											Ref: fmt.Sprintf("#/components/schemas/%s", splitTypeName[len(splitTypeName)-1]),
+										},
+									},
+								}
+							}
+						} else {
+							for _, contentType := range res.ContentType {
+								content[contentType] = Content{
+									Schema: Schema{
 										Ref: fmt.Sprintf("#/components/schemas/%s", splitTypeName[len(splitTypeName)-1]),
 									},
-								},
+								}
 							}
 						}
-					} else {
-						for _, contentType := range res.ContentType {
-							content[contentType] = Content{
-								Schema: Schema{
-									Ref: fmt.Sprintf("#/components/schemas/%s", splitTypeName[len(splitTypeName)-1]),
-								},
-							}
+						headerMap := make(map[string]Header)
+						for header, value := range res.Headers {
+							headerMap[header] = Header{Schema: Schema{Type: parseGOTypeToSwaggerType(reflect.TypeOf(value).Kind(), reflect.ValueOf(value).Type())}}
+						}
+						responses[fmt.Sprintf("%d", res.Code)] = Response{
+							Headers:     headerMap,
+							Description: fmt.Sprintf("%d response", res.Code),
+							Content:     content,
 						}
 					}
-
-					headerMap := make(map[string]Header)
-
-					for header, value := range res.Headers {
-						headerMap[header] = Header{Schema: Schema{Type: parseGOTypeToSwaggerType(reflect.TypeOf(value).Kind(), reflect.ValueOf(value).Type())}}
-					}
-
-					responses[fmt.Sprintf("%d", res.Code)] = Response{
-						Headers:     headerMap,
-						Description: fmt.Sprintf("%d response", res.Code),
-						Content:     content,
+				} else {
+					responses[""] = Response{
+						Description: "",
 					}
 				}
-			} else {
-				responses[""] = Response{
-					Description: "",
-				}
-			}
-
-			securityMemberships := []map[string][]string{}
-
-			if rd.AuthenticationConfiguration != nil {
-				if rd.AuthenticationConfiguration.BasicAuth != nil {
-					if rd.AuthenticationConfiguration.BasicAuth.Name == "" {
-						rd.AuthenticationConfiguration.BasicAuth.Name = "basic"
+				securityMemberships := []map[string][]string{}
+				if rd.AuthenticationConfiguration != nil {
+					if rd.AuthenticationConfiguration.BasicAuth != nil {
+						if rd.AuthenticationConfiguration.BasicAuth.Name == "" {
+							rd.AuthenticationConfiguration.BasicAuth.Name = "basic"
+						}
+						securityMemberships = append(securityMemberships, map[string][]string{
+							rd.AuthenticationConfiguration.BasicAuth.Name: {},
+						})
 					}
-					securityMemberships = append(securityMemberships, map[string][]string{
-						rd.AuthenticationConfiguration.BasicAuth.Name: {},
-					})
-				}
-				if rd.AuthenticationConfiguration.BearerAuth != nil {
-					if rd.AuthenticationConfiguration.BearerAuth.Name == "" {
-						rd.AuthenticationConfiguration.BearerAuth.Name = "bearer"
+					if rd.AuthenticationConfiguration.BearerAuth != nil {
+						if rd.AuthenticationConfiguration.BearerAuth.Name == "" {
+							rd.AuthenticationConfiguration.BearerAuth.Name = "bearer"
+						}
+						securityMemberships = append(securityMemberships, map[string][]string{
+							rd.AuthenticationConfiguration.BearerAuth.Name: {},
+						})
 					}
-					securityMemberships = append(securityMemberships, map[string][]string{
-						rd.AuthenticationConfiguration.BearerAuth.Name: {},
-					})
-				}
-				if rd.AuthenticationConfiguration.ApiKeyAuth != nil {
-					if rd.AuthenticationConfiguration.ApiKeyAuth.Name == "" {
-						rd.AuthenticationConfiguration.ApiKeyAuth.Name = "apiKey"
+					if rd.AuthenticationConfiguration.ApiKeyAuth != nil {
+						if rd.AuthenticationConfiguration.ApiKeyAuth.Name == "" {
+							rd.AuthenticationConfiguration.ApiKeyAuth.Name = "apiKey"
+						}
+						securityMemberships = append(securityMemberships, map[string][]string{
+							rd.AuthenticationConfiguration.ApiKeyAuth.Name: {},
+						})
 					}
-					securityMemberships = append(securityMemberships, map[string][]string{
-						rd.AuthenticationConfiguration.ApiKeyAuth.Name: {},
-					})
-				}
-				if rd.AuthenticationConfiguration.OpenIdAuth != nil {
-					if rd.AuthenticationConfiguration.OpenIdAuth.Name == "" {
-						rd.AuthenticationConfiguration.OpenIdAuth.Name = "openId"
+					if rd.AuthenticationConfiguration.OpenIdAuth != nil {
+						if rd.AuthenticationConfiguration.OpenIdAuth.Name == "" {
+							rd.AuthenticationConfiguration.OpenIdAuth.Name = "openId"
+						}
+						securityMemberships = append(securityMemberships, map[string][]string{
+							rd.AuthenticationConfiguration.OpenIdAuth.Name: {},
+						})
 					}
-					securityMemberships = append(securityMemberships, map[string][]string{
-						rd.AuthenticationConfiguration.OpenIdAuth.Name: {},
-					})
-				}
-				if rd.AuthenticationConfiguration.Oauth2Auth != nil {
-					if rd.AuthenticationConfiguration.Oauth2Auth.Name == "" {
-						rd.AuthenticationConfiguration.Oauth2Auth.Name = "oauth2"
+					if rd.AuthenticationConfiguration.Oauth2Auth != nil {
+						if rd.AuthenticationConfiguration.Oauth2Auth.Name == "" {
+							rd.AuthenticationConfiguration.Oauth2Auth.Name = "oauth2"
+						}
+						securityMemberships = append(securityMemberships, map[string][]string{
+							rd.AuthenticationConfiguration.Oauth2Auth.Name: rd.OauthScopes,
+						})
 					}
-					securityMemberships = append(securityMemberships, map[string][]string{
-						rd.AuthenticationConfiguration.Oauth2Auth.Name: rd.OauthScopes,
-					})
 				}
-			}
-
-			paths[route.Path][strings.ToLower(rd.Method)] = Path{
-				Tags:        []string{tagName},
-				Summary:     rd.Summary,
-				Description: rd.Description,
-				OperationID: fmt.Sprintf("%s-%s", rd.Method, route.Path),
-				Parameters:  parameters,
-				RequestBody: body,
-				Responses:   responses,
-				Security:    securityMemberships,
+				paths[fullPath][strings.ToLower(rd.Method)] = Path{
+					Tags:        []string{tagName},
+					Summary:     rd.Summary,
+					Description: rd.Description,
+					OperationID: fmt.Sprintf("%s-%s", rd.Method, fullPath),
+					Parameters:  parameters,
+					RequestBody: body,
+					Responses:   responses,
+					Security:    securityMemberships,
+				}
 			}
 		}
-
 	}
-
 	return paths, nil
 }
 
 func (c *SwaggoMux) getSecuritySchemas() map[string]SecurityScheme {
-	allAuthenticationConfigurations := ext.Where(ext.SliceMap(ext.FlattenMap(c.routes, func(route Route) []RequestDetails {
+	// Flatten all Route values from the map
+	var allRoutes []Route
+	for _, methodMap := range c.routes {
+		for _, route := range methodMap {
+			allRoutes = append(allRoutes, route)
+		}
+	}
+	allAuthenticationConfigurations := ext.Where(ext.SliceMap(ext.FlattenMap(allRoutes, func(route Route) []RequestDetails {
 		return route.RequestDetails
 	}), func(requestDetails RequestDetails) *AuthenticationConfiguration {
 		return requestDetails.AuthenticationConfiguration
