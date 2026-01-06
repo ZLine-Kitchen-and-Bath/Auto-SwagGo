@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lorenparvin/Auto-SwagGo/internal/ext"
+	"github.com/ZLine-Kitchen-and-Bath/Auto-SwagGo/internal/ext"
 )
 
 var IGNORED_TAGS = []string{"swagger", "openapi.json"}

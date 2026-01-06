@@ -3,7 +3,7 @@ package tests
 import (
 	"testing"
 
-	"github.com/lorenparvin/Auto-SwagGo/internal/ext"
+	"github.com/ZLine-Kitchen-and-Bath/Auto-SwagGo/internal/ext"
 )
 
 func TestSequenceEqual(t *testing.T) {
