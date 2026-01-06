@@ -3,7 +3,7 @@ package tests
 import (
 	"testing"
 
-	"github.com/Pieeer1/Auto-SwagGo/internal/ext"
+	"github.com/lorenparvin/Auto-SwagGo/internal/ext"
 )
 
 type DistinctByTestStruct struct {

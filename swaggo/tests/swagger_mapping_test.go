@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Pieeer1/Auto-SwagGo/swaggo"
+	"github.com/lorenparvin/Auto-SwagGo/swaggo"
 )
 
 // good test because it covers a large amount of the types possible

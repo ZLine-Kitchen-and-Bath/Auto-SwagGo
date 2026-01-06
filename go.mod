@@ -1,3 +1,3 @@
-module github.com/Pieeer1/Auto-SwagGo
+module github.com/lorenparvin/Auto-SwagGo
 
 go 1.22.5
